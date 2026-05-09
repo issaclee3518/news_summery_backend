@@ -49,7 +49,7 @@ async def fetch_news_api():
         print("DEBUG: [NewsAPI] 키가 없습니다.")
         return []
     url = "https://newsapi.org/v2/top-headlines"
-    params = {"country": "kr", "apiKey": NEWS_API_KEY, "pageSize": 3}
+    params = {"country": "us", "apiKey": NEWS_API_KEY, "pageSize": 3}
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, params=params)
@@ -69,7 +69,7 @@ async def fetch_currents_api():
         return []
     url = "https://api.currentsapi.services/v1/latest-news"
     headers = {"Authorization": CURRENTS_API_KEY} 
-    params = {"language": "ko", "country": "kr"}
+    params = {"language": "en", "country": "us"}
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, headers=headers, params=params)
