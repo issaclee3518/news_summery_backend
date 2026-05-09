@@ -2,34 +2,46 @@ import asyncio
 import httpx
 import os
 import json
-import redis.asyncio as redis  # 비동기 Redis 라이브러리
+import redis.asyncio as redis
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware # CORS 추가
 from pydantic import BaseModel
 from typing import List, Optional
 from dotenv import load_dotenv
 
-# .env 파일 로드
+# .env 파일 로드 (로컬 개발용)
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="News Summary API")
 
-# --- [설정 및 환경 변수] ---
+# --- [1. CORS 설정] ---
+# 배포 환경에서는 ["*"] 대신 실제 앱의 도메인이나 IP만 적는 것이 보안에 좋습니다.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 모든 도메인 허용 (테스트 단계)
+    allow_credentials=True,
+    allow_methods=["*"],  # GET, POST, OPTIONS 등 모든 메소드 허용
+    allow_headers=["*"],  # 모든 헤더 허용
+)
+
+# --- [2. 환경 변수 유연화] ---
+# 클라우드 서비스마다 제공하는 Redis 주소 형식이 다르므로 URL 방식을 지원하도록 수정합니다.
 NEWS_API_KEY = os.getenv("NewsAPI_org_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CURRENTS_API_KEY = os.getenv("CURRENTS_API_KEY")
 
-# Redis 연결 설정 (기본값: localhost, 6379)
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-CACHE_TTL = 3600  # 캐시 유지 시간 (1시간)
+# 클라우드 Redis(Upstash 등)는 보통 REDIS_URL 하나로 주소를 줍니다.
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+CACHE_TTL = int(os.getenv("CACHE_TTL", 3600))
 
-# 비동기 Redis 클라이언트 초기화
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+# Redis 클라이언트 초기화 (URL 방식)
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
-print(f"--- 시스템 체크 ---")
-print(f"NewsAPI: {'✅' if NEWS_API_KEY else '❌'}")
-print(f"CurrentsAPI: {'✅' if CURRENTS_API_KEY else '❌'}")
-print(f"Redis 연결 준비 완료 (TTL: {CACHE_TTL}s)")
+# --- [3. 서버 상태 체크 (Health Check)] ---
+# 배포 서비스(Railway, Render 등)에서 서버가 잘 살아있는지 확인할 때 사용합니다.
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 # --- [모델 정의] ---
 class NewsSummary(BaseModel):
@@ -37,8 +49,9 @@ class NewsSummary(BaseModel):
     summary: Optional[str] = "요약 실패"
     source: str
 
-# --- [뉴스 호출 로직 1 & 2: 기존과 동일] ---
+# --- [뉴스 호출 로직: 이전과 동일] ---
 async def fetch_news_api():
+    if not NEWS_API_KEY: return []
     url = "https://newsapi.org/v2/top-headlines"
     params = {"country": "us", "apiKey": NEWS_API_KEY, "pageSize": 3}
     async with httpx.AsyncClient() as client:
@@ -49,6 +62,7 @@ async def fetch_news_api():
         except: return []
 
 async def fetch_currents_api():
+    if not CURRENTS_API_KEY: return []
     url = "https://api.currentsapi.services/v1/latest-news"
     headers = {"Authorization": CURRENTS_API_KEY} 
     params = {"language": "en", "country": "us"}
@@ -60,10 +74,10 @@ async def fetch_currents_api():
             return [{"title": a["title"], "content": a.get("description") or a["title"], "source": "CurrentsAPI"} for a in articles[:3]]
         except: return []
 
-# --- [AI 요약 로직] ---
 async def summarize_with_ai(article: dict):
+    if not OPENAI_API_KEY: return {"title": article['title'], "summary": "AI 키 없음", "source": article['source']}
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
@@ -76,48 +90,39 @@ async def summarize_with_ai(article: dict):
                 }
             )
             summary = response.json()['choices'][0]['message']['content']
-            # Pydantic 모델 대신 딕셔너리로 반환 (JSON 직렬화를 위해)
             return {"title": article['title'], "summary": summary, "source": article['source']}
     except:
         return {"title": article['title'], "summary": "요약 실패", "source": article['source']}
 
-# --- [엔드포인트: Redis 로직 통합] ---
-
+# --- [메인 엔드포인트] ---
 @app.get("/news-summary", response_model=List[NewsSummary])
 async def get_integrated_summaries():
     cache_key = "integrated_news_cache"
 
-    # 1. Redis에서 캐시된 데이터가 있는지 확인
     try:
         cached_data = await redis_client.get(cache_key)
         if cached_data:
-            print("⚡️ [Redis] 캐시된 데이터를 반환합니다.")
             return json.loads(cached_data)
-    except Exception as e:
-        print(f"Redis 읽기 중 에러 (무시하고 진행): {e}")
+    except: pass
 
-    # 2. 캐시가 없으면 실제 뉴스 호출 및 요약 진행
-    print("🌐 [API] 실시간 뉴스 수집 및 AI 요약 중...")
     news_tasks = [fetch_news_api(), fetch_currents_api()]
     news_results = await asyncio.gather(*news_tasks)
     all_articles = news_results[0] + news_results[1]
     
-    if not all_articles:
-        return []
+    if not all_articles: return []
 
     summary_tasks = [summarize_with_ai(a) for a in all_articles]
     final_results = await asyncio.gather(*summary_tasks)
     
-    # 3. 결과를 Redis에 저장 (TTL 설정)
     try:
-        # ensure_ascii=False를 해줘야 한국어가 깨지지 않고 저장됩니다.
-        await redis_client.setex(
-            cache_key,
-            CACHE_TTL,
-            json.dumps(final_results, ensure_ascii=False)
-        )
-        print(f"✅ [Redis] 새로운 요약 데이터를 캐시에 저장했습니다. (TTL: {CACHE_TTL}s)")
-    except Exception as e:
-        print(f"Redis 쓰기 중 에러: {e}")
+        await redis_client.setex(cache_key, CACHE_TTL, json.dumps(final_results, ensure_ascii=False))
+    except: pass
 
     return final_results
+
+# --- [실행 설정] ---
+if __name__ == "__main__":
+    import uvicorn
+    # 배포 환경에서는 PORT 환경 변수를 사용해야 합니다.
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
