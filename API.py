@@ -53,7 +53,7 @@ class NewsSummary(BaseModel):
 async def fetch_news_api():
     if not NEWS_API_KEY: return []
     url = "https://newsapi.org/v2/top-headlines"
-    params = {"country": "us", "apiKey": NEWS_API_KEY, "pageSize": 3}
+    params = {"country": "kr", "apiKey": NEWS_API_KEY, "pageSize": 3}
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, params=params)
@@ -65,7 +65,7 @@ async def fetch_currents_api():
     if not CURRENTS_API_KEY: return []
     url = "https://api.currentsapi.services/v1/latest-news"
     headers = {"Authorization": CURRENTS_API_KEY} 
-    params = {"language": "en", "country": "us"}
+    params = {"language": "kr", "country": "kr"}
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, headers=headers, params=params)
